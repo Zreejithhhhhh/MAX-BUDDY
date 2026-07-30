@@ -1,0 +1,338 @@
+---
+name: loop-eng
+preamble-tier: 4
+version: 1.0.0
+description: |
+  Continuous engineering improvement loop. Scans codebase health,
+  prioritizes issues, implements fixes one-by-one, verifies each fix,
+  and ships. Repeats the loop autonomously. Use when asked to "loop",
+  "improve the codebase", "run the engineering loop", "continuous
+  improvement", or "fix everything systematically". (gstack)
+voice-triggers:
+  - "improvement loop"
+  - "engineering loop"
+  - "fix everything"
+  - "codebase health"
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - Agent
+  - AskUserQuestion
+  - WebSearch
+triggers:
+  - run the loop
+  - engineering loop
+  - loop engineering
+  - improve codebase
+  - fix everything
+  - code health
+  - continuous improvement
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+{{GBRAIN_CONTEXT_LOAD}}
+
+# /loop-eng: Continuous Engineering Improvement Loop
+
+You are a disciplined engineering loop agent. Your job is to continuously improve the codebase by cycling through: **Scan → Prioritize → Fix → Verify → Ship → Learn → Repeat**.
+
+Each loop iteration is one complete improvement cycle. You run the loop until the user tells you to stop, the codebase reaches a defined quality target, or you've addressed all detectable issues.
+
+## Core Principles
+
+1. **One fix per iteration.** Each loop cycle addresses exactly ONE issue. Fix it, verify it, ship it, then loop again.
+2. **Verify before ship.** Every fix must pass: lint → typecheck → tests. Never skip verification.
+3. **Atomic commits.** Each fix is one focused commit with a clear message. No bundling unrelated changes.
+4. **Self-limiting.** If the same issue keeps appearing, stop and escalate (the fix isn't working). If no issues remain, report done.
+5. **Learn.** After each loop, log what was fixed and how so future iterations get faster.
+
+## Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `target` | `auto` | Focus area: `auto`, `lint`, `types`, `tests`, `security`, `performance`, `tech-debt` |
+| `mode` | `interactive` | `interactive` (approve each loop), `autonomous` (run until done) |
+| `max-loops` | `10` | Maximum loop iterations before stopping |
+| `severity` | `all` | Minimum severity: `all`, `critical`, `high`, `medium`, `low` |
+
+Parse these from the user's invocation. Example: `/loop-eng --target types --mode autonomous --max-loops 5`
+
+## Step 0: Establish Baseline
+
+Before the first loop, capture the current state:
+
+```bash
+BASELINE_DIR="$HOME/.gstack/loop-eng"
+mkdir -p "$BASELINE_DIR"
+SLUG="${SLUG:-$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr -cd 'a-zA-Z0-9._-')}"
+BASELINE_FILE="$BASELINE_DIR/${SLUG:-unknown}-baseline.json"
+
+# Run health checks
+_LINT_COUNT=0
+_TYPE_COUNT=0
+_TEST_COUNT=0
+_TODO_COUNT=0
+_DEP_COUNT=0
+
+command -v npx >/dev/null 2>&1 && {
+  _LINT_OUT=$(npx eslint . --format json 2>/dev/null || true)
+  _LINT_COUNT=$(echo "$_LINT_OUT" | grep -o '"errorCount":[0-9]*' | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+  _TYPE_OUT=$(npx tsc --noEmit 2>&1 || true)
+  _TYPE_COUNT=$(echo "$_TYPE_OUT" | grep -c "error TS" 2>/dev/null || echo 0)
+}
+
+# Count TODO/FIXME/HACK
+_TODO_COUNT=$(grep -r "TODO\|FIXME\|HACK\|XXX" --include="*.{ts,js,tsx,jsx,py,go,rb,rs,java,swift}" . 2>/dev/null | wc -l)
+
+# Count dependencies
+_DEP_COUNT=$(cat package.json 2>/dev/null | grep -c '"dependencies"' || echo 0)
+
+cat > "$BASELINE_FILE" <<- BASELINE_EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "repo": "${SLUG:-unknown}",
+  "lint_errors": ${_LINT_COUNT:-0},
+  "type_errors": ${_TYPE_COUNT:-0},
+  "todo_count": ${_TODO_COUNT:-0},
+  "deps": ${_DEP_COUNT:-0}
+}
+BASELINE_EOF
+
+echo "=== /loop-eng Baseline ==="
+echo "Repo: ${SLUG:-unknown}"
+echo "Lint errors: ${_LINT_COUNT:-0}"
+echo "Type errors: ${_TYPE_COUNT:-0}"
+echo "TODOs/FIXMEs: ${_TODO_COUNT:-0}"
+echo "Baseline saved: $BASELINE_FILE"
+echo "=========================="
+```
+
+If no baseline file exists from a previous run, create one. Otherwise, load it for comparison.
+
+## Step 1: Scan
+
+Run diagnostics to find issues. Use the `target` parameter to focus the scan:
+
+**For `auto` or `lint` target:**
+```bash
+if command -v npx >/dev/null 2>&1; then
+  npx eslint . --max-warnings 0 2>&1 || true
+  npx prettier --check . 2>&1 | tail -20 || true
+fi
+# Also check for common anti-patterns
+grep -rn "console.log" --include="*.{ts,js,tsx,jsx}" src/ 2>/dev/null | grep -v "// eslint-disable" | head -20
+grep -rn "any\b" --include="*.ts" --include="*.tsx" src/ 2>/dev/null | head -20
+```
+
+**For `types` target:**
+```bash
+if [ -f tsconfig.json ]; then
+  npx tsc --noEmit 2>&1 | head -40 || true
+fi
+```
+
+**For `tests` target:**
+```bash
+# Find test files and check for test failures
+_TEST_FILES=$(find . -name "*.test.*" -o -name "*.spec.*" 2>/dev/null | head -5)
+if [ -n "$_TEST_FILES" ]; then
+  npx vitest run --reporter=verbose 2>&1 | tail -30 || true
+  npm test 2>&1 | tail -20 || true
+fi
+# Check for missing tests
+grep -rn "it.skip\|describe.skip\|test.skip" --include="*.test.*" --include="*.spec.*" . 2>/dev/null | head -10
+```
+
+**For `security` target:**
+```bash
+# Check for hardcoded secrets
+grep -rn "api_key\|API_KEY\|secret\|password\|token" --include="*.{ts,js,tsx,jsx,py,go,rb,rs}" . 2>/dev/null | grep -v "\.env\|node_modules\|\.git" | grep -v "EXAMPLE\|example\|dummy\|test" | head -20
+# Check npm audit
+npx npm audit --audit-level=high 2>&1 | tail -20 || true
+```
+
+**For `performance` target:**
+```bash
+# Check for expensive patterns
+grep -rn "\.map\|\.filter\|\.reduce\|\.forEach" --include="*.{ts,js,tsx,jsx}" src/ 2>/dev/null | grep -v "node_modules" | head -20
+# Check bundle size if available
+if [ -d dist ] || [ -d build ]; then
+  du -sh dist/ build/ 2>/dev/null || true
+  find dist/ build/ -name "*.js" -exec wc -c {} \; 2>/dev/null | sort -rn | head -5
+fi
+```
+
+**For `tech-debt` target:**
+```bash
+# Find dead code, unused exports, commented-out code
+grep -rn "^\s*//\s*function\|^\s*//\s*const\|^\s*//\s*let\|^\s*//\s*class" --include="*.{ts,js,tsx,jsx}" src/ 2>/dev/null | head -20
+# Find deprecated patterns
+grep -rn "@deprecated\|deprecated\|@obsolete" --include="*.{ts,js,tsx,jsx,py,java}" . 2>/dev/null | head -10
+```
+
+Compile the scan results into an ordered issue list. Each issue must have:
+- **Severity**: `critical` / `high` / `medium` / `low`
+- **Category**: `lint` / `type` / `test` / `security` / `performance` / `tech-debt`
+- **File** and **line** reference
+- **Description** of the problem
+
+## Step 2: Prioritize
+
+From the scan results, select the single most impactful issue to fix:
+
+| Priority | Criteria |
+|----------|----------|
+| 1 (highest) | Type errors that would cause runtime crashes |
+| 2 | Security vulnerabilities (hardcoded secrets, injection risks) |
+| 3 | Failing tests |
+| 4 | Lint errors (especially error-level, not warnings) |
+| 5 | Performance issues in hot paths |
+| 6 | Tech debt (dead code, TODOs, deprecated patterns) |
+
+If `mode` is `interactive`, show the prioritized list and ask which issue to fix:
+```
+D1 — Engineering Loop: Next Issue
+
+Issues found (ordered by priority):
+1. [CRITICAL] src/auth.ts:45 — Hardcoded API key (security)
+2. [HIGH] src/db.ts:120 — Type error: 'undefined' not assignable (types)  
+3. [MEDIUM] src/api.ts:88 — Unused variable 'foo' (lint)
+
+Which issue should I fix next? (enter number or 'q' to quit)
+```
+
+If `mode` is `autonomous`, auto-select the highest-priority issue.
+
+## Step 3: Fix
+
+Fix the selected issue. Rules:
+
+1. **Minimal change.** Change only what's needed to fix the issue. Do not refactor unrelated code.
+2. **Follow existing patterns.** Match the code style, naming conventions, and patterns of the file you're editing.
+3. **Handle edge cases.** Don't just silence a warning — fix the root cause.
+4. **Update tests if needed.** If the fix changes behavior, update or add tests.
+
+After implementing the fix, verify:
+
+```bash
+# Re-run the specific check that found the issue to confirm it's resolved
+```
+
+## Step 4: Verify
+
+Run the full verification suite:
+
+```bash
+echo "=== Verifying fix ==="
+
+# 1. Lint
+if command -v npx >/dev/null 2>&1 && [ -f .eslintrc* ] || [ -f eslint.config* ]; then
+  npx eslint . --max-warnings 0 2>&1 || true
+fi
+
+# 2. Typecheck
+if [ -f tsconfig.json ]; then
+  npx tsc --noEmit 2>&1 || true
+fi
+
+# 3. Tests
+_TEST_PASSED=0
+if command -v npx >/dev/null 2>&1; then
+  if npx vitest run --reporter=verbose 2>&1 | tail -5; then
+    _TEST_PASSED=1
+  fi
+fi
+
+echo "=== Verification complete ==="
+```
+
+If any verification step fails AND the failure is caused by the fix, roll back and try a different approach. If the failure is pre-existing (was there before the fix), note it but don't block.
+
+## Step 5: Ship
+
+Commit and prepare for deployment:
+
+```bash
+# Get branch info
+_BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+
+# Check for uncommitted changes
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  git add -A
+  git commit -m "fix($(echo "$_CATEGORY" | tr '[:upper:]' '[:lower:]')): $_DESCRIPTION"
+fi
+```
+
+Commit message format: `fix(<category>): <brief description> — <issue-reference>`
+
+If on a feature branch and tests pass, suggest running `/ship` for the full release pipeline.
+
+## Step 6: Learn
+
+Log what was fixed for future loops:
+
+```bash
+LEARN_DIR="$HOME/.gstack/loop-eng/learnings"
+mkdir -p "$LEARN_DIR"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | $_CATEGORY | $_SEVERITY | $_FILE:$_LINE | $_DESCRIPTION" >> "$LEARN_DIR/${SLUG:-unknown}.log"
+
+# Update loop count
+_LOOP_FILE="$BASELINE_DIR/${SLUG:-unknown}-loop-count"
+echo $(($(cat "$_LOOP_FILE" 2>/dev/null || echo 0) + 1)) > "$_LOOP_FILE"
+
+# Print progress
+_LOOPS_DONE=$(cat "$_LOOP_FILE" 2>/dev/null || echo 0)
+echo "=== Loop $_LOOPS_DONE complete ==="
+echo "Fixed: $_DESCRIPTION"
+echo "Remaining issues: tracked in next scan"
+```
+
+## Step 7: Repeat (or Exit)
+
+Check whether to continue:
+
+- If `$_LOOPS_DONE >= max-loops`: print summary and stop.
+- If no issues remain in a fresh scan: print "Codebase is clean!" and stop.
+- If `mode` is `interactive`: ask "Loop again? (y/N)"
+- If `mode` is `autonomous`: immediately start the next loop from Step 1.
+
+## Summary Report
+
+When the loop exits (either completed or stopped by user), print a summary:
+
+```bash
+echo ""
+echo "╔══════════════════════════════════════════╗"
+echo "║     Engineering Loop Summary             ║"
+echo "╚══════════════════════════════════════════╝"
+echo ""
+echo "Loops completed: $(cat "$_LOOP_FILE" 2>/dev/null || echo 0)"
+echo "Focus target: ${TARGET:-auto}"
+echo "Baseline → Final:"
+_BASELINE=$(cat "$BASELINE_FILE" 2>/dev/null || echo "{}")
+echo "  Lint errors:  $(echo "$_BASELINE" | grep -o '"lint_errors":[0-9]*' | grep -o '[0-9]*' || echo '?') → ${_LINT_COUNT:-?}"
+echo "  Type errors:  $(echo "$_BASELINE" | grep -o '"type_errors":[0-9]*' | grep -o '[0-9]*' || echo '?') → ${_TYPE_COUNT:-?}"
+echo ""
+echo "Learnings: $LEARN_DIR/${SLUG:-unknown}.log"
+echo ""
+```
+
+## Special Cases
+
+**No repo detected (non-git directory):** The loop can still scan and fix files, but shipping and learnings will be limited. Print: "Working outside a git repo — fixes applied but not committed."
+
+**Pre-existing verification failures:** If lint/type/test fails BEFORE any changes, note it and offer to fix it as the first loop item.
+
+**Merge conflicts:** If `git commit` fails due to merge state, pause and ask the user to resolve conflicts first.
+
+**When to stop early:**
+- The user says "stop" or "exit"
+- 3 consecutive failed fix attempts (the approach isn't working)
+- The scan finds zero actionable issues
