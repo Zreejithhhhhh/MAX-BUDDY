@@ -30,29 +30,32 @@ async function startAuthUpstream(user: string, pass: string): Promise<MockUpstre
   let connects = 0;
   const server = net.createServer((sock) => {
     sock.once('data', (greeting) => {
-      if (greeting[0] !== 0x05) { sock.destroy(); return; }
-      const methods = greeting.subarray(2, 2 + greeting[1]);
+      const gbuf = Buffer.isBuffer(greeting) ? greeting : Buffer.from(greeting);
+      if (gbuf[0] !== 0x05) { sock.destroy(); return; }
+      const methods = gbuf.subarray(2, 2 + gbuf[1]);
       if (!methods.includes(0x02)) { sock.write(Buffer.from([0x05, 0xFF])); sock.destroy(); return; }
       sock.write(Buffer.from([0x05, 0x02]));
       sock.once('data', (auth) => {
-        const ulen = auth[1];
-        const uname = auth.subarray(2, 2 + ulen).toString();
-        const plen = auth[2 + ulen];
-        const passwd = auth.subarray(3 + ulen, 3 + ulen + plen).toString();
+        const abuf = Buffer.isBuffer(auth) ? auth : Buffer.from(auth);
+        const ulen = abuf[1];
+        const uname = abuf.subarray(2, 2 + ulen).toString();
+        const plen = abuf[2 + ulen];
+        const passwd = abuf.subarray(3 + ulen, 3 + ulen + plen).toString();
         if (uname !== user || passwd !== pass) {
           sock.write(Buffer.from([0x01, 0x01])); sock.destroy(); return;
         }
         sock.write(Buffer.from([0x01, 0x00]));
         sock.once('data', (req) => {
-          const atyp = req[3];
+          const rbuf = Buffer.isBuffer(req) ? req : Buffer.from(req);
+          const atyp = rbuf[3];
           let host: string; let port: number;
           if (atyp === 0x01) {
-            host = `${req[4]}.${req[5]}.${req[6]}.${req[7]}`;
-            port = req.readUInt16BE(8);
+            host = `${rbuf[4]}.${rbuf[5]}.${rbuf[6]}.${rbuf[7]}`;
+            port = rbuf.readUInt16BE(8);
           } else if (atyp === 0x03) {
-            const len = req[4];
-            host = req.subarray(5, 5 + len).toString();
-            port = req.readUInt16BE(5 + len);
+            const len = rbuf[4];
+            host = rbuf.subarray(5, 5 + len).toString();
+            port = rbuf.readUInt16BE(5 + len);
           } else {
             sock.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
             sock.destroy(); return;
